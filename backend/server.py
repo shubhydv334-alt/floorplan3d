@@ -99,6 +99,10 @@ def _timed_response(data: dict, t0: float) -> Response:
 def index():
     return send_from_directory("../frontend", "index.html")
 
+@app.route("/<path:filename>")
+def serve_static(filename):
+    return send_from_directory("../frontend", filename)
+
 
 @app.route("/health")
 def health():
@@ -159,7 +163,18 @@ def analyze():
     logger.info(f"Analyzing {w}×{h} image ({size_kb} KB)")
 
     try:
-        result = detect_floor_plan(image_bytes)
+        # P8: Configurable orthogonal tolerance
+        ortho_tol = 0.5
+        if request.args.get("ortho_tol"):
+            ortho_tol = float(request.args.get("ortho_tol"))
+        elif request.is_json:
+            data = request.get_json(silent=True) or {}
+            if "ortho_tol" in data:
+                ortho_tol = float(data["ortho_tol"])
+        elif request.form.get("ortho_tol"):
+            ortho_tol = float(request.form.get("ortho_tol"))
+
+        result = detect_floor_plan(image_bytes, ortho_tol=ortho_tol)
         logger.info(f"Done in {round((time.perf_counter()-t0)*1000)} ms — {result['summary']}")
         return _timed_response(result, t0)
     except ValueError as e:
@@ -788,8 +803,117 @@ def _generate_demo_plan(preset: str = "complex") -> np.ndarray:
     return img
 
 
+# ─────────────────────────────────────────────────────────────
+# IFC EXPORT (P15)
+# ─────────────────────────────────────────────────────────────
+
+@app.route("/export/ifc", methods=["POST"])
+def export_ifc():
+    """Generate an IFC4 file from the detection topology."""
+    t0 = time.perf_counter()
+    data = request.get_json(silent=True) or {}
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    try:
+        import ifcopenshell
+        import ifcopenshell.api
+        import tempfile, uuid
+
+        world_size = data.get("world_size", 20)
+        wall_height = data.get("wall_height", 2.8)
+        IW = data.get("image_width", 800)
+        IH = data.get("image_height", 600)
+
+        def px(x): return float(x * (world_size / IW) - world_size / 2)
+        def pz(y): return float(y * (world_size / IH) - world_size / 2)
+
+        # Create IFC file
+        ifc = ifcopenshell.api.run("project.create_file", version="IFC4")
+
+        # Project
+        project = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcProject", name="FloorPlan3D")
+        
+        # Units
+        ifcopenshell.api.run("unit.assign_unit", ifc)
+        
+        # Context
+        ctx = ifcopenshell.api.run("context.add_context", ifc, context_type="Model")
+        body = ifcopenshell.api.run("context.add_context", ifc,
+            context_type="Model", context_identifier="Body", target_view="MODEL_VIEW", parent=ctx)
+
+        # Site -> Building -> Storey
+        site = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcSite", name="Site")
+        building = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcBuilding", name="Building")
+        storey = ifcopenshell.api.run("root.create_entity", ifc, ifc_class="IfcBuildingStorey", name="Ground Floor")
+        
+        ifcopenshell.api.run("aggregate.assign_object", ifc, relating_object=project, products=[site])
+        ifcopenshell.api.run("aggregate.assign_object", ifc, relating_object=site, products=[building])
+        ifcopenshell.api.run("aggregate.assign_object", ifc, relating_object=building, products=[storey])
+
+        wall_count = 0
+        # Add walls
+        for seg_type in ["outer_walls", "inner_walls", "closets"]:
+            for seg in data.get(seg_type, []):
+                x1, z1 = px(seg["x1"]), pz(seg["y1"])
+                x2, z2 = px(seg["x2"]), pz(seg["y2"])
+                length = ((x2-x1)**2 + (z2-z1)**2)**0.5
+                if length < 0.05:
+                    continue
+                
+                thickness = max(0.08, seg.get("original_thickness_px", seg.get("thickness_px", 8)) * (world_size / IW) * 2)
+                
+                wall = ifcopenshell.api.run("root.create_entity", ifc,
+                    ifc_class="IfcWall", name=f"{seg_type[:-1]}_{wall_count}")
+                ifcopenshell.api.run("spatial.assign_container", ifc, relating_structure=storey, products=[wall])
+                wall_count += 1
+
+        # Add rooms as IfcSpace
+        for i, room in enumerate(data.get("rooms", [])):
+            space = ifcopenshell.api.run("root.create_entity", ifc,
+                ifc_class="IfcSpace", name=room.get("label", f"Room {i+1}"))
+            ifcopenshell.api.run("spatial.assign_container", ifc, relating_structure=storey, products=[space])
+
+        # Add doors
+        for i, door in enumerate(data.get("doors", [])):
+            d = ifcopenshell.api.run("root.create_entity", ifc,
+                ifc_class="IfcDoor", name=f"Door_{i+1}")
+            ifcopenshell.api.run("spatial.assign_container", ifc, relating_structure=storey, products=[d])
+
+        # Add windows
+        for i, win in enumerate(data.get("windows", [])):
+            w = ifcopenshell.api.run("root.create_entity", ifc,
+                ifc_class="IfcWindow", name=f"Window_{i+1}")
+            ifcopenshell.api.run("spatial.assign_container", ifc, relating_structure=storey, products=[w])
+
+        # Write to temp file and return
+        tmp = tempfile.NamedTemporaryFile(suffix=".ifc", delete=False)
+        ifc.write(tmp.name)
+        tmp.close()
+
+        with open(tmp.name, "r") as f:
+            ifc_content = f.read()
+
+        os.unlink(tmp.name)
+
+        resp = app.response_class(
+            response=ifc_content,
+            status=200,
+            mimetype="application/x-step"
+        )
+        resp.headers["Content-Disposition"] = "attachment; filename=floor-plan.ifc"
+        resp.headers["X-Process-Time-Ms"] = str(round((time.perf_counter() - t0) * 1000))
+        return resp
+
+    except ImportError:
+        return jsonify({"error": "ifcopenshell is not installed on the server. Run: pip install ifcopenshell"}), 501
+    except Exception as e:
+        logger.exception("IFC export error")
+        return jsonify({"error": f"IFC export failed: {str(e)}"}), 500
+
+
 if __name__ == "__main__":
     port  = int(os.environ.get("PORT",  5050))
     debug = os.environ.get("DEBUG","true").lower() == "true"
     logger.info(f"FloorPlan3D v6 starting on port {port}  (debug={debug})")
-    app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)

@@ -20,7 +20,7 @@ if errorlevel 1 (
 
 :: Install dependencies
 echo  [1/3] Installing Python dependencies...
-pip install flask flask-cors opencv-python-headless numpy --quiet
+pip install flask flask-cors opencv-python-headless numpy pymupdf pytesseract ifcopenshell --quiet
 if errorlevel 1 (
     echo  [ERROR] pip install failed. Try: pip install -r backend/requirements.txt
     pause

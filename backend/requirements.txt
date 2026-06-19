@@ -1,5 +1,8 @@
-flask>=2.3.0
-flask-cors>=4.0.0
-opencv-python-headless>=4.8.0
-numpy>=1.24.0
-pymupdf>=1.20.0
+Flask==3.0.0
+flask-cors==4.0.0
+opencv-python-headless==4.8.1.78
+numpy==1.26.2
+Werkzeug==3.0.1
+pydantic==2.5.2
+ultralytics==8.1.0
+easyocr==1.7.1
